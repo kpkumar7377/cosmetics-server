@@ -1,32 +1,35 @@
 const mongoose = require("mongoose");
 
-let isConnected = false;
+let cached = global.mongoose;
 
-const connectDB = async () => {
-  // Return existing active connection if already connected (readyState 1)
-  if (mongoose.connection.readyState === 1) {
-    return;
+if (!cached) {
+  cached = global.mongoose = { conn: null, promise: null };
+}
+
+async function connectDB() {
+  if (cached.conn) {
+    return cached.conn;
   }
 
-  // If already connecting (readyState 2), wait for it
-  if (mongoose.connection.readyState === 2) {
-    await new Promise((resolve) => {
-      mongoose.connection.once("connected", resolve);
-    });
-    return;
+  if (!cached.promise) {
+    const opts = {
+      bufferCommands: false,
+      serverSelectionTimeoutMS: 5000,
+    };
+
+    cached.promise = mongoose
+      .connect(process.env.MONGO_URI, opts)
+      .then((m) => m);
   }
 
   try {
-    const conn = await mongoose.connect(process.env.MONGO_URI, {
-      bufferCommands: false, // Prevents queries from queuing/hanging for 10s if DB is down
-    });
-    isConnected = true;
-    console.log("MongoDB connected:", conn.connection.host);
-  } catch (err) {
-    console.error("MongoDB connection failed:", err.message);
-    // Throw error so the Express middleware catches it and returns a 500 JSON response
-    throw err;
+    cached.conn = await cached.promise;
+  } catch (e) {
+    cached.promise = null;
+    throw e;
   }
-};
+
+  return cached.conn;
+}
 
 module.exports = connectDB;
