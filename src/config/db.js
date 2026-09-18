@@ -6,24 +6,18 @@ if (!cached) {
   cached = global.mongoose = { conn: null, promise: null };
 }
 
-const connectDB = async () => {
+async function connectDB() {
   if (cached.conn) {
     return cached.conn;
   }
 
   if (!cached.promise) {
     const opts = {
-      bufferCommands: false, // Disables Mongoose command buffering so it fails fast instead of hanging
-      maxPoolSize: 10,
+      bufferCommands: false, // Throws immediately if disconnected instead of freezing 10s
       serverSelectionTimeoutMS: 5000,
     };
 
-    cached.promise = mongoose
-      .connect(process.env.MONGODB_URI, opts)
-      .then((mongooseInstance) => {
-        console.log("[MongoDB] Connected successfully to Atlas");
-        return mongooseInstance;
-      });
+    cached.promise = mongoose.connect(process.env.MONGODB_URI, opts).then((m) => m);
   }
 
   try {
@@ -34,6 +28,6 @@ const connectDB = async () => {
   }
 
   return cached.conn;
-};
+}
 
 module.exports = connectDB;
