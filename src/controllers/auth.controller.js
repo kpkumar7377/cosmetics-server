@@ -1,0 +1,238 @@
+const jwt = require("jsonwebtoken");
+const bcrypt = require("bcryptjs");
+const User = require("../models/User");
+
+const signToken = (user) =>
+  jwt.sign({ id: user._id, role: user.role }, process.env.JWT_SECRET, {
+    expiresIn: process.env.JWT_EXPIRES_IN || "15m",
+  });
+
+const signRefreshToken = (user) =>
+  jwt.sign({ id: user._id }, process.env.JWT_REFRESH_SECRET, {
+    expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || "7d",
+  });
+
+const setRefreshCookie = (res, refreshToken) => {
+  res.cookie("refreshToken", refreshToken, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "lax",
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+  });
+};
+
+const sanitize = (user) => ({
+  id: user._id,
+  name: user.name,
+  email: user.email,
+  role: user.role,
+  avatar: user.avatar,
+  authProvider: user.authProvider,
+});
+
+// POST /api/auth/register
+const register = async (req, res) => {
+  const { name, email, password } = req.body;
+  if (!name || !email || !password) {
+    return res
+      .status(400)
+      .json({ message: "Name, email and password are required" });
+  }
+
+  const exists = await User.findOne({ email: email.toLowerCase() });
+  if (exists)
+    return res.status(400).json({ message: "Email already registered" });
+
+  const passwordHash = await bcrypt.hash(password, 10);
+  const user = await User.create({
+    name,
+    email,
+    passwordHash,
+    authProvider: "local",
+  });
+
+  setRefreshCookie(res, signRefreshToken(user));
+  res.status(201).json({ token: signToken(user), user: sanitize(user) });
+};
+
+// POST /api/auth/login
+const login = async (req, res) => {
+  const { email, password } = req.body;
+  const normalizedEmail = (email || "").toLowerCase();
+
+  const adminEmail = (process.env.ADMIN_EMAIL || "").toLowerCase();
+  const adminPass = process.env.ADMIN_PASS;
+
+  if (
+    adminEmail &&
+    adminPass &&
+    normalizedEmail === adminEmail &&
+    password === adminPass
+  ) {
+    let adminUser = await User.findOne({ email: adminEmail });
+
+    if (!adminUser) {
+      adminUser = await User.create({
+        name: "Admin",
+        email: adminEmail,
+        passwordHash: await bcrypt.hash(adminPass, 10),
+        role: "admin",
+        authProvider: "local",
+      });
+    } else if (adminUser.role !== "admin") {
+      adminUser.role = "admin";
+      await adminUser.save();
+    }
+
+    setRefreshCookie(res, signRefreshToken(adminUser));
+    return res.json({ token: signToken(adminUser), user: sanitize(adminUser) });
+  }
+
+  const user = await User.findOne({ email: normalizedEmail });
+  if (!user || !user.passwordHash) {
+    return res.status(401).json({ message: "Invalid credentials" });
+  }
+
+  const match = await bcrypt.compare(password, user.passwordHash);
+  if (!match) return res.status(401).json({ message: "Invalid credentials" });
+
+  setRefreshCookie(res, signRefreshToken(user));
+  res.json({ token: signToken(user), user: sanitize(user) });
+};
+
+// GET /api/auth/me
+const me = async (req, res) => {
+  res.json({ user: sanitize(req.user) });
+};
+
+// POST /api/auth/refresh — reissues an access token from the httpOnly refresh cookie
+const refresh = async (req, res) => {
+  const token = req.cookies?.refreshToken;
+  if (!token) return res.status(401).json({ message: "No refresh token" });
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_REFRESH_SECRET);
+    const user = await User.findById(decoded.id);
+    if (!user) return res.status(401).json({ message: "User not found" });
+
+    res.json({ token: signToken(user), user: sanitize(user) });
+  } catch (err) {
+    return res
+      .status(401)
+      .json({ message: "Invalid or expired refresh token" });
+  }
+};
+
+// POST /api/auth/logout
+const logout = async (req, res) => {
+  res.clearCookie("refreshToken");
+  res.json({ message: "Logged out" });
+};
+
+// POST /api/auth/forgot-password
+const forgotPassword = async (req, res) => {
+  const { email } = req.body;
+  const user = await User.findOne({ email: (email || "").toLowerCase() });
+
+  // Check for OAuth account explicitly
+  if (user && user.authProvider === "google") {
+    return res.status(400).json({
+      code: "AUTH_PROVIDER_GOOGLE",
+      message:
+        "This account was created with Google. Please sign in using Google.",
+    });
+  }
+
+  // Generic anti-enumeration response for non-existent users
+  if (!user) {
+    return res.json({
+      message: "If that email is registered, a reset link has been sent.",
+    });
+  }
+
+  const resetToken = jwt.sign({ id: user._id }, process.env.JWT_SECRET, {
+    expiresIn: "1h",
+  });
+  user.resetPasswordToken = resetToken;
+  user.resetPasswordExpires = Date.now() + 60 * 60 * 1000;
+  await user.save();
+
+  const { sendPasswordReset } = require("../services/email.service");
+  const resetUrl = `${process.env.CLIENT_URL}/reset-password?token=${resetToken}`;
+  await sendPasswordReset(user.email, resetUrl);
+
+  return res.json({
+    message: "If that email is registered, a reset link has been sent.",
+  });
+};
+// POST /api/auth/reset-password
+const resetPassword = async (req, res) => {
+  const { token, newPassword } = req.body;
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const user = await User.findOne({
+      _id: decoded.id,
+      resetPasswordToken: token,
+      resetPasswordExpires: { $gt: Date.now() },
+    });
+    if (!user)
+      return res
+        .status(400)
+        .json({ message: "Reset link is invalid or has expired" });
+
+    user.passwordHash = await bcrypt.hash(newPassword, 10);
+    user.resetPasswordToken = undefined;
+    user.resetPasswordExpires = undefined;
+    await user.save();
+
+    res.json({ message: "Password updated — you can now log in." });
+  } catch (err) {
+    return res
+      .status(400)
+      .json({ message: "Reset link is invalid or has expired" });
+  }
+};
+
+// GET /api/auth/google/callback
+// Runs after passport.authenticate('google', ...) has already populated req.user
+const googleCallback = (req, res) => {
+  const user = req.user;
+  setRefreshCookie(res, signRefreshToken(user));
+  const token = signToken(user);
+
+  // Redirect back to the storefront with the access token so the
+  // frontend can store it (e.g. in memory / a short-lived cookie).
+  res.redirect(`${process.env.CLIENT_URL}/auth/callback?token=${token}`);
+};
+
+// POST /api/auth/change-password
+// Authenticated flow (protect middleware) — no current-password check by design:
+// this is reached only from the logged-in account menu, not a public link.
+const changePassword = async (req, res) => {
+  const { newPassword } = req.body;
+  if (!newPassword || newPassword.length < 8) {
+    return res
+      .status(400)
+      .json({ message: "Password must be at least 8 characters long" });
+  }
+
+  const user = await User.findById(req.user._id);
+  if (!user) return res.status(404).json({ message: "User not found" });
+
+  user.passwordHash = await bcrypt.hash(newPassword, 10);
+  await user.save();
+
+  res.json({ message: "Password updated successfully." });
+};
+
+module.exports = {
+  register,
+  login,
+  me,
+  refresh,
+  logout,
+  forgotPassword,
+  resetPassword,
+  googleCallback,
+  changePassword,
+};
