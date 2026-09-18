@@ -2,7 +2,7 @@ require("dotenv").config();
 const dns = require("dns");
 
 // Force Node.js to use Google DNS for SRV record lookups
-dns.setServers(["8.8.8.8", "8.8.4.4"]);
+// dns.setServers(["8.8.8.8", "8.8.4.4"]);
 const app = require("./src/app");
 const connectDB = require("./src/config/db");
 
