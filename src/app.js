@@ -27,7 +27,9 @@ app.use(
     credentials: true,
   })
 );
-app.use(express.json());
+// server.js or app.js
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ limit: "10mb", extended: true }));
 app.use(cookieParser());
 
 // Session is required by Passport's OAuth handshake even though the rest
