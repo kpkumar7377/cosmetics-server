@@ -1,7 +1,3 @@
-require("dotenv").config();
-const dns = require("dns");
-dns.setServers(["8.8.8.8", "8.8.4.4"]);
-const connectDB = require("./config/db");
 const express = require("express");
 const cors = require("cors");
 const cookieParser = require("cookie-parser");
@@ -25,31 +21,11 @@ const { notFound, errorHandler } = require("./middleware/error.middleware");
 
 const app = express();
 
-app.use(async (req, res, next) => {
-  // Allow health/root checks to bypass DB
-  if (req.path === "/" || req.path === "/api/health") {
-    return next();
-  }
-
-  try {
-    await connectDB();
-    next();
-  } catch (err) {
-    console.error("Database connection error:", err);
-    return res.status(500).json({
-      error: "Failed to connect to database",
-      message: err.message,
-      code: err.code,
-      reason: err.reason || null,
-    });
-  }
-});
-
 app.use(
   cors({
     origin: [process.env.CLIENT_URL, process.env.ADMIN_URL],
     credentials: true,
-  }),
+  })
 );
 app.use(express.json());
 app.use(cookieParser());
@@ -61,7 +37,7 @@ app.use(
     secret: process.env.SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
-  }),
+  })
 );
 app.use(passport.initialize());
 app.use(passport.session());
