@@ -5,18 +5,7 @@ const dns = require("dns");
 
 const PORT = process.env.PORT || 5000;
 
-// Reconnect/reuse DB connection for serverless requests
-app.use(async (req, res, next) => {
-  try {
-    await connectDB();
-    next();
-  } catch (err) {
-    console.error("MongoDB connection error:", err);
-    return res.status(500).json({ error: "Database connection failed" });
-  }
-});
-
-// Run local listener only outside production
+// Local development setup
 if (process.env.NODE_ENV !== "production") {
   dns.setServers(["8.8.8.8", "8.8.4.4"]);
 
@@ -25,4 +14,14 @@ if (process.env.NODE_ENV !== "production") {
   });
 }
 
-module.exports = app;
+// Serverless entry point for Vercel
+module.exports = async (req, res) => {
+  try {
+    await connectDB();
+  } catch (err) {
+    console.error("MongoDB connection error:", err);
+    return res.status(500).json({ error: "Database connection failed", message: err.message });
+  }
+
+  return app(req, res);
+};
