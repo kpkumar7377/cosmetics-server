@@ -43,6 +43,7 @@ app.use(passport.initialize());
 app.use(passport.session());
 
 app.get("/api/health", (req, res) => res.json({ status: "ok" }));
+app.get("/", (req, res) => res.json({ status: "ok" }));
 
 app.use("/api/auth", authRoutes);
 app.use("/api/products", productRoutes);
