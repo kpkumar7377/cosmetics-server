@@ -330,8 +330,64 @@ const sendPromotionalEmail = async ({ to, subject, htmlContent }) => {
   });
 };
 
+// REGISTRATION OTP VERIFICATION
+const sendRegistrationOtpEmail = async (toEmail, name, otp) => {
+  const firstName = name ? name.split(" ")[0] : "Beauty Enthusiast";
+
+  const bodyContent = `
+    <!-- Top Header -->
+    <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="margin-bottom: 20px;">
+      <tr>
+        <td>
+          <span style="font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 1.5px; color: #B85D43; display: block; margin-bottom: 4px;">
+            Security & Authentication
+          </span>
+          <h1 style="margin: 0 0 10px; font-family: Georgia, serif; font-size: 22px; color: #1A1A1A; font-weight: normal;">
+            Verify Your Email
+          </h1>
+          <p style="margin: 0; font-size: 13px; color: #525252; line-height: 1.6;">
+            Hello ${firstName}, thank you for registering with ${BRAND_NAME}. Please enter the verification code below to complete your registration.
+          </p>
+        </td>
+      </tr>
+    </table>
+
+    <!-- OTP Display Box -->
+    <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="margin: 28px 0;">
+      <tr>
+        <td align="center">
+          <div style="display: inline-block; background-color: #FAF8F5; border: 1px solid rgba(212, 175, 55, 0.3); border-radius: 12px; padding: 18px 36px; text-align: center;">
+            <span style="font-family: 'Courier New', Courier, monospace; font-size: 32px; font-weight: 700; letter-spacing: 8px; color: #1A1A1A;">
+              ${otp}
+            </span>
+          </div>
+        </td>
+      </tr>
+    </table>
+
+    <!-- Expiry Notice -->
+    <div style="background-color: #FAF8F5; border-left: 3px solid #B85D43; padding: 12px 14px; border-radius: 4px; margin-bottom: 12px;">
+      <p style="margin: 0; font-size: 12px; color: #525252; line-height: 1.5;">
+        <strong>Notice:</strong> This code is valid for <strong>10 minutes</strong>. Never share this verification code with anyone.
+      </p>
+    </div>
+  `;
+
+  await resend.emails.send({
+    from: process.env.EMAIL_FROM,
+    to: toEmail,
+    subject: `Your Verification Code: ${otp}`,
+    html: renderEmailShell({
+      title: "Verify Your Email Address",
+      preheader: `Your verification code is ${otp}. It expires in 10 minutes.`,
+      bodyContent,
+    }),
+  });
+};
+
 module.exports = {
   sendOrderConfirmation,
   sendPasswordReset,
   sendPromotionalEmail,
+  sendRegistrationOtpEmail,
 };

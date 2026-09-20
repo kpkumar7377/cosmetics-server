@@ -1,6 +1,14 @@
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
+const redisClient = require("../config/redis");
 const User = require("../models/User");
+const {
+  sendPasswordReset,
+  sendRegistrationOtpEmail,
+} = require("../services/email.service");
+
+const generateOTP = () =>
+  Math.floor(100000 + Math.random() * 900000).toString();
 
 const signToken = (user) =>
   jwt.sign({ id: user._id, role: user.role }, process.env.JWT_SECRET, {
@@ -30,7 +38,138 @@ const sanitize = (user) => ({
   authProvider: user.authProvider,
 });
 
-// POST /api/auth/register
+// POST /api/auth/register/send-otp
+// POST /api/auth/register/send-otp
+const sendRegistrationOtp = async (req, res, next) => {
+  try {
+    const { email, name, password, phone } = req.body;
+
+    if (!email || !password || !name) {
+      return res.status(400).json({
+        success: false,
+        message: "Name, email, and password are required.",
+      });
+    }
+
+    if (password.length < 8) {
+      return res.status(400).json({
+        success: false,
+        message: "Password must be at least 8 characters long.",
+      });
+    }
+
+    const normalizedEmail = email.toLowerCase().trim();
+
+    // Check if user already exists
+    const existingUser = await User.findOne({ email: normalizedEmail });
+    if (existingUser) {
+      return res.status(409).json({
+        success: false,
+        message: "An account with this email already exists.",
+      });
+    }
+
+    const otp = generateOTP();
+    const salt = await bcrypt.genSalt(10);
+    const hashedOtp = await bcrypt.hash(otp, salt);
+    const passwordHash = await bcrypt.hash(password, salt);
+
+    // Cache payload and hashed OTP in Redis for 10 minutes (600 seconds)
+    const redisKey = `registration_otp:${normalizedEmail}`;
+    const payload = JSON.stringify({
+      name,
+      email: normalizedEmail,
+      phone: phone || "",
+      passwordHash,
+      hashedOtp,
+    });
+
+    // ioredis syntax: set(key, value, "EX", ttlSeconds)
+    await redisClient.set(redisKey, payload, "EX", 600);
+
+    // Send OTP via Resend mailer
+    await sendRegistrationOtpEmail(normalizedEmail, name, otp);
+
+    return res.status(200).json({
+      success: true,
+      message: "Verification OTP has been sent to your email.",
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// POST /api/auth/register/verify-otp
+const verifyRegistrationOtp = async (req, res, next) => {
+  try {
+    const { email, otp } = req.body;
+
+    if (!email || !otp) {
+      return res.status(400).json({
+        success: false,
+        message: "Email and verification code are required.",
+      });
+    }
+
+    const normalizedEmail = email.toLowerCase().trim();
+    const redisKey = `registration_otp:${normalizedEmail}`;
+    const cachedData = await redisClient.get(redisKey);
+
+    if (!cachedData) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Verification code expired or not found. Please request a new one.",
+      });
+    }
+
+    const parsedData = JSON.parse(cachedData);
+
+    const isMatch = await bcrypt.compare(otp.trim(), parsedData.hashedOtp);
+    if (!isMatch) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid verification code." });
+    }
+
+    // Double check before creating in case created in parallel
+    const alreadyExists = await User.findOne({ email: normalizedEmail });
+    if (alreadyExists) {
+      await redisClient.del(redisKey);
+      return res.status(409).json({
+        success: false,
+        message: "An account with this email already exists.",
+      });
+    }
+
+    // Persist verified user
+    const newUser = await User.create({
+      name: parsedData.name,
+      email: parsedData.email,
+      phone: parsedData.phone,
+      passwordHash: parsedData.passwordHash,
+      authProvider: "local",
+      isVerified: true,
+    });
+
+    // Delete Redis cache key
+    await redisClient.del(redisKey);
+
+    // Set refresh token cookie & return JWT access token
+    setRefreshCookie(res, signRefreshToken(newUser));
+
+    return res.status(201).json({
+      success: true,
+      message: "Account verified and registered successfully.",
+      user: sanitize(newUser),
+      token: signToken(newUser),
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// Legacy Direct Register (kept optional / fallback)
 const register = async (req, res) => {
   const { name, email, password } = req.body;
   if (!name || !email || !password) {
@@ -39,28 +178,29 @@ const register = async (req, res) => {
       .json({ message: "Name, email and password are required" });
   }
 
-  const exists = await User.findOne({ email: email.toLowerCase() });
+  const normalizedEmail = email.toLowerCase().trim();
+  const exists = await User.findOne({ email: normalizedEmail });
   if (exists)
     return res.status(400).json({ message: "Email already registered" });
 
   const passwordHash = await bcrypt.hash(password, 10);
   const user = await User.create({
     name,
-    email,
+    email: normalizedEmail,
     passwordHash,
     authProvider: "local",
   });
 
   setRefreshCookie(res, signRefreshToken(user));
-  res.status(201).json({ token: signToken(user), user: sanitize(user) });
+  return res.status(201).json({ token: signToken(user), user: sanitize(user) });
 };
 
 // POST /api/auth/login
 const login = async (req, res) => {
   const { email, password } = req.body;
-  const normalizedEmail = (email || "").toLowerCase();
+  const normalizedEmail = (email || "").toLowerCase().trim();
 
-  const adminEmail = (process.env.ADMIN_EMAIL || "").toLowerCase();
+  const adminEmail = (process.env.ADMIN_EMAIL || "").toLowerCase().trim();
   const adminPass = process.env.ADMIN_PASS;
 
   if (
@@ -97,7 +237,7 @@ const login = async (req, res) => {
   if (!match) return res.status(401).json({ message: "Invalid credentials" });
 
   setRefreshCookie(res, signRefreshToken(user));
-  res.json({ token: signToken(user), user: sanitize(user) });
+  return res.json({ token: signToken(user), user: sanitize(user) });
 };
 
 // GET /api/auth/me
@@ -105,7 +245,7 @@ const me = async (req, res) => {
   res.json({ user: sanitize(req.user) });
 };
 
-// POST /api/auth/refresh — reissues an access token from the httpOnly refresh cookie
+// POST /api/auth/refresh
 const refresh = async (req, res) => {
   const token = req.cookies?.refreshToken;
   if (!token) return res.status(401).json({ message: "No refresh token" });
@@ -132,9 +272,10 @@ const logout = async (req, res) => {
 // POST /api/auth/forgot-password
 const forgotPassword = async (req, res) => {
   const { email } = req.body;
-  const user = await User.findOne({ email: (email || "").toLowerCase() });
+  const user = await User.findOne({
+    email: (email || "").toLowerCase().trim(),
+  });
 
-  // Check for OAuth account explicitly
   if (user && user.authProvider === "google") {
     return res.status(400).json({
       code: "AUTH_PROVIDER_GOOGLE",
@@ -143,7 +284,6 @@ const forgotPassword = async (req, res) => {
     });
   }
 
-  // Generic anti-enumeration response for non-existent users
   if (!user) {
     return res.json({
       message: "If that email is registered, a reset link has been sent.",
@@ -157,7 +297,6 @@ const forgotPassword = async (req, res) => {
   user.resetPasswordExpires = Date.now() + 60 * 60 * 1000;
   await user.save();
 
-  const { sendPasswordReset } = require("../services/email.service");
   const resetUrl = `${process.env.CLIENT_URL}/reset-password?token=${resetToken}`;
   await sendPasswordReset(user.email, resetUrl);
 
@@ -165,6 +304,7 @@ const forgotPassword = async (req, res) => {
     message: "If that email is registered, a reset link has been sent.",
   });
 };
+
 // POST /api/auth/reset-password
 const resetPassword = async (req, res) => {
   const { token, newPassword } = req.body;
@@ -194,20 +334,14 @@ const resetPassword = async (req, res) => {
 };
 
 // GET /api/auth/google/callback
-// Runs after passport.authenticate('google', ...) has already populated req.user
 const googleCallback = (req, res) => {
   const user = req.user;
   setRefreshCookie(res, signRefreshToken(user));
   const token = signToken(user);
-
-  // Redirect back to the storefront with the access token so the
-  // frontend can store it (e.g. in memory / a short-lived cookie).
   res.redirect(`${process.env.CLIENT_URL}/auth/callback?token=${token}`);
 };
 
 // POST /api/auth/change-password
-// Authenticated flow (protect middleware) — no current-password check by design:
-// this is reached only from the logged-in account menu, not a public link.
 const changePassword = async (req, res) => {
   const { newPassword } = req.body;
   if (!newPassword || newPassword.length < 8) {
@@ -226,6 +360,8 @@ const changePassword = async (req, res) => {
 };
 
 module.exports = {
+  sendRegistrationOtp,
+  verifyRegistrationOtp,
   register,
   login,
   me,
