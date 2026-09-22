@@ -2,11 +2,25 @@ const { Resend } = require("resend");
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 
-const BRAND_NAME = "COSMETICS STORE";
-const SUPPORT_EMAIL = "support@cosmeticsstore.in";
+// 1. Config & Environment Variables
+const BRAND_NAME = process.env.BRAND_NAME || "COSMETICS STORE";
+const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || "support@cosmeticsstore.in";
 const SITE_URL = process.env.CLIENT_URL || "https://cosmeticsstore.in";
 
-// Reusable Email Base Shell
+// 2. Clean email parsing to prevent Vercel quote/bracket escaping issues
+const rawEmail = process.env.EMAIL_FROM || "info@cosmeticsstore.in";
+// Removes quotes, whitespace, and any pre-existing < > brackets
+const cleanEmailAddress = rawEmail
+  .replace(/['"]+/g, "")
+  .replace(/[<>]/g, "")
+  .trim();
+
+// Generates valid RFC-compliant format: "COSMETICS STORE <info@cosmeticsstore.in>"
+const DEFAULT_SENDER = `${BRAND_NAME} <${cleanEmailAddress}>`;
+
+// ==========================================
+// BASE EMAIL SHELL
+// ==========================================
 const renderEmailShell = ({ title, preheader, bodyContent }) => `
 <!DOCTYPE html>
 <html lang="en">
@@ -78,33 +92,35 @@ const renderEmailShell = ({ title, preheader, bodyContent }) => `
 </html>
 `;
 
-// ORDER CONFIRMATION
-const sendOrderConfirmation = async (order) => {
-  const to = order.user?.email || order.guestInfo?.email;
-  if (!to) return;
+// ==========================================
+// REUSABLE DISPATCH FUNCTION
+// ==========================================
+const sendEmail = async ({ to, subject, preheader, bodyContent }) => {
+  if (!to) {
+    console.warn(
+      "[Resend] Email dispatch canceled: Missing recipient ('to') address.",
+    );
+    return null;
+  }
 
-  const recipientName =
-    order.user?.name ||
-    order.guestInfo?.name ||
-    order.shippingAddress?.name ||
-    "Beauty Enthusiast";
+  return await resend.emails.send({
+    from: DEFAULT_SENDER,
+    to,
+    subject,
+    html: renderEmailShell({
+      title: subject,
+      preheader: preheader || subject,
+      bodyContent,
+    }),
+  });
+};
 
-  const orderDate = new Date(order.createdAt || Date.now()).toLocaleDateString(
-    "en-IN",
-    {
-      month: "long",
-      day: "numeric",
-      year: "numeric",
-    },
-  );
+// ==========================================
+// TEMPLATE BUILDERS
+// ==========================================
 
-  const formattedTotal = Number(order.total || 0).toLocaleString("en-IN");
-  const formattedSubtotal = Number(order.subtotal || 0).toLocaleString("en-IN");
-  const shippingText =
-    order.shippingFee === 0 ? "FREE" : `₹${order.shippingFee}`;
-
-  // Product Items Rows
-  const itemsHtml = (order.items || [])
+const buildOrderItemsHtml = (items = []) =>
+  items
     .map(
       (item) => `
       <tr>
@@ -139,111 +155,104 @@ const sendOrderConfirmation = async (order) => {
     )
     .join("");
 
-  const bodyContent = `
-    <!-- Top Greeting -->
-    <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="margin-bottom: 24px;">
-      <tr>
-        <td>
-          <span style="font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 1.5px; color: #B85D43; display: block; margin-bottom: 4px;">
-            Order Confirmed
-          </span>
-          <h1 style="margin: 0 0 10px; font-family: Georgia, serif; font-size: 22px; color: #1A1A1A; font-weight: normal;">
-            Thank you for your order, ${recipientName.split(" ")[0]}!
-          </h1>
-          <p style="margin: 0; font-size: 13px; color: #525252; line-height: 1.6;">
-            We've received your order <strong>#${order.orderNumber}</strong> placed on ${orderDate}. Our fulfillment team is preparing your package for dispatch.
-          </p>
-        </td>
-      </tr>
-    </table>
+const templates = {
+  orderConfirmation: (order, recipientName, orderDate) => {
+    const formattedTotal = Number(order.total || 0).toLocaleString("en-IN");
+    const formattedSubtotal = Number(order.subtotal || 0).toLocaleString(
+      "en-IN",
+    );
+    const shippingText =
+      order.shippingFee === 0 ? "FREE" : `₹${order.shippingFee}`;
 
-    <!-- Call to Action Link -->
-    <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="margin-bottom: 28px;">
-      <tr>
-        <td align="left">
-          <a href="${SITE_URL}/account/orders/${order._id || order.orderNumber}" 
-             style="display: inline-block; background-color: #1A1A1A; color: #FAF8F5; text-decoration: none; padding: 12px 24px; border-radius: 8px; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 1px;">
-            View & Track Order &rarr;
-          </a>
-        </td>
-      </tr>
-    </table>
+    return `
+      <!-- Top Greeting -->
+      <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="margin-bottom: 24px;">
+        <tr>
+          <td>
+            <span style="font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 1.5px; color: #B85D43; display: block; margin-bottom: 4px;">
+              Order Confirmed
+            </span>
+            <h1 style="margin: 0 0 10px; font-family: Georgia, serif; font-size: 22px; color: #1A1A1A; font-weight: normal;">
+              Thank you for your order, ${recipientName.split(" ")[0]}!
+            </h1>
+            <p style="margin: 0; font-size: 13px; color: #525252; line-height: 1.6;">
+              We've received your order <strong>#${order.orderNumber}</strong> placed on ${orderDate}. Our fulfillment team is preparing your package for dispatch.
+            </p>
+          </td>
+        </tr>
+      </table>
 
-    <!-- Itemized List -->
-    <p style="margin: 0 0 10px; font-family: Georgia, serif; font-size: 15px; color: #1A1A1A; font-weight: 600;">
-      Order Summary
-    </p>
-    <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="margin-bottom: 20px;">
-      ${itemsHtml}
-    </table>
+      <!-- Action Link -->
+      <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="margin-bottom: 28px;">
+        <tr>
+          <td align="left">
+            <a href="${SITE_URL}/account/orders/${order._id || order.orderNumber}" 
+               style="display: inline-block; background-color: #1A1A1A; color: #FAF8F5; text-decoration: none; padding: 12px 24px; border-radius: 8px; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 1px;">
+              View & Track Order &rarr;
+            </a>
+          </td>
+        </tr>
+      </table>
 
-    <!-- Price Breakdown -->
-    <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="margin-bottom: 28px; background-color: #FAF8F5; border-radius: 8px; padding: 16px;">
-      <tr>
-        <td style="font-size: 12px; color: #737373; padding: 3px 0;">Subtotal</td>
-        <td align="right" style="font-size: 12px; color: #1A1A1A; font-weight: 500; padding: 3px 0;">₹${formattedSubtotal}</td>
-      </tr>
+      <!-- Itemized Summary -->
+      <p style="margin: 0 0 10px; font-family: Georgia, serif; font-size: 15px; color: #1A1A1A; font-weight: 600;">
+        Order Summary
+      </p>
+      <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="margin-bottom: 20px;">
+        ${buildOrderItemsHtml(order.items)}
+      </table>
+
+      <!-- Price Breakdown -->
+      <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="margin-bottom: 28px; background-color: #FAF8F5; border-radius: 8px; padding: 16px;">
+        <tr>
+          <td style="font-size: 12px; color: #737373; padding: 3px 0;">Subtotal</td>
+          <td align="right" style="font-size: 12px; color: #1A1A1A; font-weight: 500; padding: 3px 0;">₹${formattedSubtotal}</td>
+        </tr>
+        ${
+          order.discountAmount
+            ? `<tr>
+                <td style="font-size: 12px; color: #047857; padding: 3px 0;">Promotional Discount</td>
+                <td align="right" style="font-size: 12px; color: #047857; font-weight: 500; padding: 3px 0;">-₹${Number(order.discountAmount).toLocaleString("en-IN")}</td>
+              </tr>`
+            : ""
+        }
+        <tr>
+          <td style="font-size: 12px; color: #737373; padding: 3px 0;">Shipping</td>
+          <td align="right" style="font-size: 12px; color: #1A1A1A; font-weight: 500; padding: 3px 0;">${shippingText}</td>
+        </tr>
+        <tr>
+          <td style="font-size: 12px; color: #737373; padding: 3px 0;">Payment Method</td>
+          <td align="right" style="font-size: 12px; color: #1A1A1A; font-weight: 500; padding: 3px 0; text-transform: uppercase;">${order.payment?.method === "cod" ? "Cash on Delivery" : "Online Payment"}</td>
+        </tr>
+        <tr>
+          <td colspan="2" style="border-top: 1px solid rgba(212, 175, 55, 0.2); padding-top: 10px; margin-top: 6px;"></td>
+        </tr>
+        <tr>
+          <td style="font-family: Georgia, serif; font-size: 14px; font-weight: 600; color: #1A1A1A;">Total Paid</td>
+          <td align="right" style="font-family: Georgia, serif; font-size: 16px; font-weight: 600; color: #1A1A1A;">₹${formattedTotal}</td>
+        </tr>
+      </table>
+
+      <!-- Destination Summary -->
       ${
-        order.discountAmount
-          ? `<tr>
-              <td style="font-size: 12px; color: #047857; padding: 3px 0;">Promotional Discount</td>
-              <td align="right" style="font-size: 12px; color: #047857; font-weight: 500; padding: 3px 0;">-₹${Number(order.discountAmount).toLocaleString("en-IN")}</td>
-            </tr>`
+        order.shippingAddress
+          ? `
+        <div style="border: 1px solid rgba(212, 175, 55, 0.2); border-radius: 8px; padding: 14px 16px; background-color: #FFFFFF;">
+          <p style="margin: 0 0 6px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 1px; color: #B85D43;">
+            Shipping Destination
+          </p>
+          <p style="margin: 0; font-size: 12px; color: #525252; line-height: 1.5;">
+            <strong>${order.shippingAddress.name}</strong><br />
+            ${order.shippingAddress.line1}${order.shippingAddress.line2 ? `, ${order.shippingAddress.line2}` : ""}<br />
+            ${order.shippingAddress.city},${order.shippingAddress.state} - ${order.shippingAddress.pincode}<br />${order.shippingAddress.phone ? `Phone: ${order.shippingAddress.phone}` : ""}
+          </p>
+        </div>`
           : ""
       }
-      <tr>
-        <td style="font-size: 12px; color: #737373; padding: 3px 0;">Shipping</td>
-        <td align="right" style="font-size: 12px; color: #1A1A1A; font-weight: 500; padding: 3px 0;">${shippingText}</td>
-      </tr>
-      <tr>
-        <td style="font-size: 12px; color: #737373; padding: 3px 0;">Payment Method</td>
-        <td align="right" style="font-size: 12px; color: #1A1A1A; font-weight: 500; padding: 3px 0; text-transform: uppercase;">${order.payment?.method === "cod" ? "Cash on Delivery" : "Online Payment"}</td>
-      </tr>
-      <tr>
-        <td colspan="2" style="border-top: 1px solid rgba(212, 175, 55, 0.2); padding-top: 10px; margin-top: 6px;"></td>
-      </tr>
-      <tr>
-        <td style="font-family: Georgia, serif; font-size: 14px; font-weight: 600; color: #1A1A1A;">Total Paid</td>
-        <td align="right" style="font-family: Georgia, serif; font-size: 16px; font-weight: 600; color: #1A1A1A;">₹${formattedTotal}</td>
-      </tr>
-    </table>
+    `;
+  },
 
-    <!-- Shipping Address Summary -->
-    ${
-      order.shippingAddress
-        ? `
-      <div style="border: 1px solid rgba(212, 175, 55, 0.2); border-radius: 8px; padding: 14px 16px; background-color: #FFFFFF;">
-        <p style="margin: 0 0 6px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 1px; color: #B85D43;">
-          Shipping Destination
-        </p>
-        <p style="margin: 0; font-size: 12px; color: #525252; line-height: 1.5;">
-          <strong>${order.shippingAddress.name}</strong><br />
-          ${order.shippingAddress.line1}${order.shippingAddress.line2 ? `, ${order.shippingAddress.line2}` : ""}<br />
-          ${order.shippingAddress.city}, ${order.shippingAddress.state} - ${order.shippingAddress.pincode}<br />
-          ${order.shippingAddress.phone ? `Phone: ${order.shippingAddress.phone}` : ""}
-        </p>
-      </div>`
-        : ""
-    }
-  `;
-
-  await resend.emails.send({
-    from: process.env.EMAIL_FROM,
-    to,
-    subject: `Order Confirmed — #${order.orderNumber}`,
-    html: renderEmailShell({
-      title: `Order Confirmed #${order.orderNumber}`,
-      preheader: `Thank you for your order #${order.orderNumber}. We're preparing your package for dispatch.`,
-      bodyContent,
-    }),
-  });
-};
-
-// PASSWORD RESET
-const sendPasswordReset = async (toEmail, resetUrl) => {
-  console.log("Sending password reset email to:", toEmail);
-  const bodyContent = `
-    <!-- Top Lock Header -->
+  passwordReset: (toEmail, resetUrl) => `
     <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="margin-bottom: 20px;">
       <tr>
         <td>
@@ -260,7 +269,6 @@ const sendPasswordReset = async (toEmail, resetUrl) => {
       </tr>
     </table>
 
-    <!-- CTA Button -->
     <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="margin: 28px 0;">
       <tr>
         <td align="center">
@@ -272,14 +280,12 @@ const sendPasswordReset = async (toEmail, resetUrl) => {
       </tr>
     </table>
 
-    <!-- Expiry Notice -->
     <div style="background-color: #FAF8F5; border-left: 3px solid #B85D43; padding: 12px 14px; border-radius: 4px; margin-bottom: 24px;">
       <p style="margin: 0; font-size: 12px; color: #525252; line-height: 1.5;">
         <strong>Notice:</strong> This password reset link will expire in <strong>1 hour</strong>. If you did not initiate this request, no further action is required and your password remains unchanged.
       </p>
     </div>
 
-    <!-- Fallback Plain Link -->
     <div style="border-top: 1px solid rgba(212, 175, 55, 0.15); padding-top: 18px;">
       <p style="margin: 0 0 6px; font-size: 11px; color: #737373;">
         Having trouble with the button? Copy and paste this link into your browser:
@@ -288,54 +294,9 @@ const sendPasswordReset = async (toEmail, resetUrl) => {
         <a href="${resetUrl}" style="color: #B85D43; text-decoration: underline;">${resetUrl}</a>
       </p>
     </div>
-  `;
+  `,
 
-  await resend.emails.send({
-    from: process.env.EMAIL_FROM,
-    to: toEmail,
-    subject: "Reset your password",
-    html: renderEmailShell({
-      title: "Reset your password",
-      preheader: "Reset your account password. This link expires in 1 hour.",
-      bodyContent,
-    }),
-  });
-};
-
-// Add at the bottom of cosmeticsstore/server/src/services/email.service.js:
-
-const sendPromotionalEmail = async ({ to, subject, htmlContent }) => {
-  if (!to) return;
-
-  const bodyContent = `
-    <div style="font-size: 14px; color: #1A1A1A; line-height: 1.7;">
-      ${htmlContent}
-    </div>
-    <div style="margin-top: 32px; padding-top: 16px; border-top: 1px solid rgba(212, 175, 55, 0.2); text-align: center;">
-      <p style="font-size: 11px; color: #737373; margin: 0;">
-        You are receiving this exclusive announcement because you joined the ${BRAND_NAME} VIP newsletter.
-      </p>
-    </div>
-  `;
-
-  await resend.emails.send({
-    from: process.env.EMAIL_FROM,
-    to,
-    subject,
-    html: renderEmailShell({
-      title: subject,
-      preheader: subject,
-      bodyContent,
-    }),
-  });
-};
-
-// REGISTRATION OTP VERIFICATION
-const sendRegistrationOtpEmail = async (toEmail, name, otp) => {
-  const firstName = name ? name.split(" ")[0] : "Beauty Enthusiast";
-
-  const bodyContent = `
-    <!-- Top Header -->
+  registrationOtp: (firstName, otp) => `
     <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="margin-bottom: 20px;">
       <tr>
         <td>
@@ -352,7 +313,6 @@ const sendRegistrationOtpEmail = async (toEmail, name, otp) => {
       </tr>
     </table>
 
-    <!-- OTP Display Box -->
     <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="margin: 28px 0;">
       <tr>
         <td align="center">
@@ -365,23 +325,93 @@ const sendRegistrationOtpEmail = async (toEmail, name, otp) => {
       </tr>
     </table>
 
-    <!-- Expiry Notice -->
     <div style="background-color: #FAF8F5; border-left: 3px solid #B85D43; padding: 12px 14px; border-radius: 4px; margin-bottom: 12px;">
       <p style="margin: 0; font-size: 12px; color: #525252; line-height: 1.5;">
         <strong>Notice:</strong> This code is valid for <strong>10 minutes</strong>. Never share this verification code with anyone.
       </p>
     </div>
-  `;
+  `,
 
-  await resend.emails.send({
-    from: process.env.EMAIL_FROM,
+  promotional: (htmlContent) => `
+    <div style="font-size: 14px; color: #1A1A1A; line-height: 1.7;">
+      ${htmlContent}
+    </div>
+    <div style="margin-top: 32px; padding-top: 16px; border-top: 1px solid rgba(212, 175, 55, 0.2); text-align: center;">
+      <p style="font-size: 11px; color: #737373; margin: 0;">
+        You are receiving this exclusive announcement because you joined the ${BRAND_NAME} VIP newsletter.
+      </p>
+    </div>
+  `,
+};
+
+// ==========================================
+// EXPORTED SERVICE FUNCTIONS
+// ==========================================
+
+const sendOrderConfirmation = async (order) => {
+  const to = order.user?.email || order.guestInfo?.email;
+  if (!to) return;
+
+  const recipientName =
+    order.user?.name ||
+    order.guestInfo?.name ||
+    order.shippingAddress?.name ||
+    "Beauty Enthusiast";
+
+  const orderDate = new Date(order.createdAt || Date.now()).toLocaleDateString(
+    "en-IN",
+    {
+      month: "long",
+      day: "numeric",
+      year: "numeric",
+    },
+  );
+
+  const bodyContent = templates.orderConfirmation(
+    order,
+    recipientName,
+    orderDate,
+  );
+
+  return await sendEmail({
+    to,
+    subject: `Order Confirmed — #${order.orderNumber}`,
+    preheader: `Thank you for your order #${order.orderNumber}. We're preparing your package for dispatch.`,
+    bodyContent,
+  });
+};
+
+const sendPasswordReset = async (toEmail, resetUrl) => {
+  const bodyContent = templates.passwordReset(toEmail, resetUrl);
+
+  return await sendEmail({
+    to: toEmail,
+    subject: "Reset your password",
+    preheader: "Reset your account password. This link expires in 1 hour.",
+    bodyContent,
+  });
+};
+
+const sendRegistrationOtpEmail = async (toEmail, name, otp) => {
+  const firstName = name ? name.split(" ")[0] : "Beauty Enthusiast";
+  const bodyContent = templates.registrationOtp(firstName, otp);
+
+  return await sendEmail({
     to: toEmail,
     subject: `Your Verification Code: ${otp}`,
-    html: renderEmailShell({
-      title: "Verify Your Email Address",
-      preheader: `Your verification code is ${otp}. It expires in 10 minutes.`,
-      bodyContent,
-    }),
+    preheader: `Your verification code is ${otp}. It expires in 10 minutes.`,
+    bodyContent,
+  });
+};
+
+const sendPromotionalEmail = async ({ to, subject, htmlContent }) => {
+  const bodyContent = templates.promotional(htmlContent);
+
+  return await sendEmail({
+    to,
+    subject,
+    preheader: subject,
+    bodyContent,
   });
 };
 

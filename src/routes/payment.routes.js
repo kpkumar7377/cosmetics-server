@@ -87,16 +87,19 @@ router.post("/razorpay/verify", async (req, res) => {
     await session.commitTransaction();
     session.endSession();
 
-    sendOrderConfirmation(order).catch((err) =>
-      console.error("Order email failed:", err.message),
-    );
+    // ✅ AWAIT the email before sending response so Vercel doesn't kill the lambda
+    try {
+      await sendOrderConfirmation(order);
+    } catch (err) {
+      console.error("Order email failed:", err.message);
+    }
 
-    res.json({ message: "Payment verified", order });
+    return res.json({ message: "Payment verified", order });
   } catch (err) {
     await session.abortTransaction();
     session.endSession();
     console.error("Verification transaction failed:", err);
-    res
+    return res
       .status(500)
       .json({ message: "Failed to finalize payment confirmation" });
   }
@@ -141,9 +144,12 @@ router.post(
           await session.commitTransaction();
           session.endSession();
 
-          sendOrderConfirmation(order).catch((err) =>
-            console.error("Order confirmation email failed:", err.message),
-          );
+          // ✅ AWAIT email execution before returning to Razorpay webhook handler
+          try {
+            await sendOrderConfirmation(order);
+          } catch (err) {
+            console.error("Order confirmation email failed:", err.message);
+          }
         } else {
           await session.abortTransaction();
           session.endSession();
@@ -156,8 +162,7 @@ router.post(
       }
     }
 
-    res.json({ received: true });
+    return res.json({ received: true });
   },
 );
-
 module.exports = router;

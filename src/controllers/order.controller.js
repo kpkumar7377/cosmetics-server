@@ -217,14 +217,17 @@ const createOrder = async (req, res) => {
     await session.commitTransaction();
     session.endSession();
 
-    // Cache purge if inventory changed on COD
+    // Cache purge and email dispatch for COD
     if (isCod) {
       invalidateCache("products");
       const { sendOrderConfirmation } = require("../services/email.service");
       const orderForEmail = { ...createdOrder.toObject(), user: req.user };
-      sendOrderConfirmation(orderForEmail).catch((err) =>
-        console.error("Order email failed:", err.message),
-      );
+
+      try {
+        await sendOrderConfirmation(orderForEmail);
+      } catch (err) {
+        console.error("Order email failed:", err.message);
+      }
     }
 
     return res.status(201).json(createdOrder);
