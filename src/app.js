@@ -2,6 +2,8 @@ const express = require("express");
 const cors = require("cors");
 const cookieParser = require("cookie-parser");
 const session = require("express-session");
+const { RedisStore } = require("connect-redis");
+const redisClient = require("./config/redis");
 const passport = require("./config/passport");
 
 const authRoutes = require("./routes/auth.routes");
@@ -21,26 +23,42 @@ const { notFound, errorHandler } = require("./middleware/error.middleware");
 
 const app = express();
 
+// Required behind reverse proxies (like Vercel / Cloudflare) so secure cookies work properly
+app.set("trust proxy", 1);
+
 app.use(
   cors({
     origin: [process.env.CLIENT_URL, process.env.ADMIN_URL],
     credentials: true,
-  })
+  }),
 );
-// server.js or app.js
+
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ limit: "10mb", extended: true }));
 app.use(cookieParser());
 
-// Session is required by Passport's OAuth handshake even though the rest
-// of the app is stateless JWT auth (see config/passport.js).
+// Initialize RedisStore backed by your existing Redis client
+const redisStore = new RedisStore({
+  client: redisClient,
+  prefix: "sess:",
+});
+
+// Configure session with RedisStore
 app.use(
   session({
-    secret: process.env.SESSION_SECRET,
+    store: redisStore,
+    secret: process.env.SESSION_SECRET || "cosmetics-store-session-secret",
     resave: false,
     saveUninitialized: false,
-  })
+    cookie: {
+      secure: process.env.NODE_ENV === "production",
+      httpOnly: true,
+      maxAge: 1000 * 60 * 60 * 24, // 24 hours
+      sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
+    },
+  }),
 );
+
 app.use(passport.initialize());
 app.use(passport.session());
 
