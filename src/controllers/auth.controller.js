@@ -39,29 +39,12 @@ const sanitize = (user) => ({
 });
 
 // POST /api/auth/register/send-otp
-// POST /api/auth/register/send-otp
 const sendRegistrationOtp = async (req, res, next) => {
   try {
     const { email, name, password, phone } = req.body;
 
-    if (!email || !password || !name) {
-      return res.status(400).json({
-        success: false,
-        message: "Name, email, and password are required.",
-      });
-    }
-
-    if (password.length < 8) {
-      return res.status(400).json({
-        success: false,
-        message: "Password must be at least 8 characters long.",
-      });
-    }
-
-    const normalizedEmail = email.toLowerCase().trim();
-
     // Check if user already exists
-    const existingUser = await User.findOne({ email: normalizedEmail });
+    const existingUser = await User.findOne({ email });
     if (existingUser) {
       return res.status(409).json({
         success: false,
@@ -75,20 +58,17 @@ const sendRegistrationOtp = async (req, res, next) => {
     const passwordHash = await bcrypt.hash(password, salt);
 
     // Cache payload and hashed OTP in Redis for 10 minutes (600 seconds)
-    const redisKey = `registration_otp:${normalizedEmail}`;
+    const redisKey = `registration_otp:${email}`;
     const payload = JSON.stringify({
       name,
-      email: normalizedEmail,
+      email,
       phone: phone || "",
       passwordHash,
       hashedOtp,
     });
 
-    // ioredis syntax: set(key, value, "EX", ttlSeconds)
     await redisClient.set(redisKey, payload, "EX", 600);
-
-    // Send OTP via Resend mailer
-    await sendRegistrationOtpEmail(normalizedEmail, name, otp);
+    await sendRegistrationOtpEmail(email, name, otp);
 
     return res.status(200).json({
       success: true,
@@ -103,16 +83,7 @@ const sendRegistrationOtp = async (req, res, next) => {
 const verifyRegistrationOtp = async (req, res, next) => {
   try {
     const { email, otp } = req.body;
-
-    if (!email || !otp) {
-      return res.status(400).json({
-        success: false,
-        message: "Email and verification code are required.",
-      });
-    }
-
-    const normalizedEmail = email.toLowerCase().trim();
-    const redisKey = `registration_otp:${normalizedEmail}`;
+    const redisKey = `registration_otp:${email}`;
     const cachedData = await redisClient.get(redisKey);
 
     if (!cachedData) {
@@ -124,16 +95,15 @@ const verifyRegistrationOtp = async (req, res, next) => {
     }
 
     const parsedData = JSON.parse(cachedData);
-
-    const isMatch = await bcrypt.compare(otp.trim(), parsedData.hashedOtp);
+    const isMatch = await bcrypt.compare(otp, parsedData.hashedOtp);
     if (!isMatch) {
-      return res
-        .status(400)
-        .json({ success: false, message: "Invalid verification code." });
+      return res.status(400).json({
+        success: false,
+        message: "Invalid verification code.",
+      });
     }
 
-    // Double check before creating in case created in parallel
-    const alreadyExists = await User.findOne({ email: normalizedEmail });
+    const alreadyExists = await User.findOne({ email });
     if (alreadyExists) {
       await redisClient.del(redisKey);
       return res.status(409).json({
@@ -142,7 +112,6 @@ const verifyRegistrationOtp = async (req, res, next) => {
       });
     }
 
-    // Persist verified user
     const newUser = await User.create({
       name: parsedData.name,
       email: parsedData.email,
@@ -152,10 +121,7 @@ const verifyRegistrationOtp = async (req, res, next) => {
       isVerified: true,
     });
 
-    // Delete Redis cache key
     await redisClient.del(redisKey);
-
-    // Set refresh token cookie & return JWT access token
     setRefreshCookie(res, signRefreshToken(newUser));
 
     return res.status(201).json({
@@ -169,75 +135,80 @@ const verifyRegistrationOtp = async (req, res, next) => {
   }
 };
 
-// Legacy Direct Register (kept optional / fallback)
-const register = async (req, res) => {
-  const { name, email, password } = req.body;
-  if (!name || !email || !password) {
+// Legacy Direct Register
+const register = async (req, res, next) => {
+  try {
+    const { name, email, password } = req.body;
+    const exists = await User.findOne({ email });
+    if (exists) {
+      return res.status(400).json({ message: "Email already registered" });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    const user = await User.create({
+      name,
+      email,
+      passwordHash,
+      authProvider: "local",
+    });
+
+    setRefreshCookie(res, signRefreshToken(user));
     return res
-      .status(400)
-      .json({ message: "Name, email and password are required" });
+      .status(201)
+      .json({ token: signToken(user), user: sanitize(user) });
+  } catch (error) {
+    next(error);
   }
-
-  const normalizedEmail = email.toLowerCase().trim();
-  const exists = await User.findOne({ email: normalizedEmail });
-  if (exists)
-    return res.status(400).json({ message: "Email already registered" });
-
-  const passwordHash = await bcrypt.hash(password, 10);
-  const user = await User.create({
-    name,
-    email: normalizedEmail,
-    passwordHash,
-    authProvider: "local",
-  });
-
-  setRefreshCookie(res, signRefreshToken(user));
-  return res.status(201).json({ token: signToken(user), user: sanitize(user) });
 };
 
 // POST /api/auth/login
-const login = async (req, res) => {
-  const { email, password } = req.body;
-  const normalizedEmail = (email || "").toLowerCase().trim();
+const login = async (req, res, next) => {
+  try {
+    const { email, password } = req.body;
+    const adminEmail = (process.env.ADMIN_EMAIL || "").toLowerCase().trim();
+    const adminPass = process.env.ADMIN_PASS;
 
-  const adminEmail = (process.env.ADMIN_EMAIL || "").toLowerCase().trim();
-  const adminPass = process.env.ADMIN_PASS;
+    if (
+      adminEmail &&
+      adminPass &&
+      email === adminEmail &&
+      password === adminPass
+    ) {
+      let adminUser = await User.findOne({ email: adminEmail });
 
-  if (
-    adminEmail &&
-    adminPass &&
-    normalizedEmail === adminEmail &&
-    password === adminPass
-  ) {
-    let adminUser = await User.findOne({ email: adminEmail });
+      if (!adminUser) {
+        adminUser = await User.create({
+          name: "Admin",
+          email: adminEmail,
+          passwordHash: await bcrypt.hash(adminPass, 10),
+          role: "admin",
+          authProvider: "local",
+        });
+      } else if (adminUser.role !== "admin") {
+        adminUser.role = "admin";
+        await adminUser.save();
+      }
 
-    if (!adminUser) {
-      adminUser = await User.create({
-        name: "Admin",
-        email: adminEmail,
-        passwordHash: await bcrypt.hash(adminPass, 10),
-        role: "admin",
-        authProvider: "local",
+      setRefreshCookie(res, signRefreshToken(adminUser));
+      return res.json({
+        token: signToken(adminUser),
+        user: sanitize(adminUser),
       });
-    } else if (adminUser.role !== "admin") {
-      adminUser.role = "admin";
-      await adminUser.save();
     }
 
-    setRefreshCookie(res, signRefreshToken(adminUser));
-    return res.json({ token: signToken(adminUser), user: sanitize(adminUser) });
+    const user = await User.findOne({ email });
+    if (!user || !user.passwordHash) {
+      return res.status(401).json({ message: "Invalid credentials" });
+    }
+
+    const match = await bcrypt.compare(password, user.passwordHash);
+    if (!match) return res.status(401).json({ message: "Invalid credentials" });
+
+    setRefreshCookie(res, signRefreshToken(user));
+    return res.json({ token: signToken(user), user: sanitize(user) });
+  } catch (error) {
+    next(error);
   }
-
-  const user = await User.findOne({ email: normalizedEmail });
-  if (!user || !user.passwordHash) {
-    return res.status(401).json({ message: "Invalid credentials" });
-  }
-
-  const match = await bcrypt.compare(password, user.passwordHash);
-  if (!match) return res.status(401).json({ message: "Invalid credentials" });
-
-  setRefreshCookie(res, signRefreshToken(user));
-  return res.json({ token: signToken(user), user: sanitize(user) });
 };
 
 // GET /api/auth/me
@@ -270,39 +241,41 @@ const logout = async (req, res) => {
 };
 
 // POST /api/auth/forgot-password
-const forgotPassword = async (req, res) => {
-  const { email } = req.body;
-  const user = await User.findOne({
-    email: (email || "").toLowerCase().trim(),
-  });
+const forgotPassword = async (req, res, next) => {
+  try {
+    const { email } = req.body;
+    const user = await User.findOne({ email });
 
-  if (user && user.authProvider === "google") {
-    return res.status(400).json({
-      code: "AUTH_PROVIDER_GOOGLE",
-      message:
-        "This account was created with Google. Please sign in using Google.",
+    if (user && user.authProvider === "google") {
+      return res.status(400).json({
+        code: "AUTH_PROVIDER_GOOGLE",
+        message:
+          "This account was created with Google. Please sign in using Google.",
+      });
+    }
+
+    if (!user) {
+      return res.json({
+        message: "If that email is registered, a reset link has been sent.",
+      });
+    }
+
+    const resetToken = jwt.sign({ id: user._id }, process.env.JWT_SECRET, {
+      expiresIn: "1h",
     });
-  }
+    user.resetPasswordToken = resetToken;
+    user.resetPasswordExpires = Date.now() + 60 * 60 * 1000;
+    await user.save();
 
-  if (!user) {
+    const resetUrl = `${process.env.CLIENT_URL}/reset-password?token=${resetToken}`;
+    await sendPasswordReset(user.email, resetUrl);
+
     return res.json({
       message: "If that email is registered, a reset link has been sent.",
     });
+  } catch (error) {
+    next(error);
   }
-
-  const resetToken = jwt.sign({ id: user._id }, process.env.JWT_SECRET, {
-    expiresIn: "1h",
-  });
-  user.resetPasswordToken = resetToken;
-  user.resetPasswordExpires = Date.now() + 60 * 60 * 1000;
-  await user.save();
-
-  const resetUrl = `${process.env.CLIENT_URL}/reset-password?token=${resetToken}`;
-  await sendPasswordReset(user.email, resetUrl);
-
-  return res.json({
-    message: "If that email is registered, a reset link has been sent.",
-  });
 };
 
 // POST /api/auth/reset-password
@@ -315,10 +288,11 @@ const resetPassword = async (req, res) => {
       resetPasswordToken: token,
       resetPasswordExpires: { $gt: Date.now() },
     });
-    if (!user)
+    if (!user) {
       return res
         .status(400)
         .json({ message: "Reset link is invalid or has expired" });
+    }
 
     user.passwordHash = await bcrypt.hash(newPassword, 10);
     user.resetPasswordToken = undefined;
@@ -342,21 +316,19 @@ const googleCallback = (req, res) => {
 };
 
 // POST /api/auth/change-password
-const changePassword = async (req, res) => {
-  const { newPassword } = req.body;
-  if (!newPassword || newPassword.length < 8) {
-    return res
-      .status(400)
-      .json({ message: "Password must be at least 8 characters long" });
+const changePassword = async (req, res, next) => {
+  try {
+    const { newPassword } = req.body;
+    const user = await User.findById(req.user._id);
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    user.passwordHash = await bcrypt.hash(newPassword, 10);
+    await user.save();
+
+    res.json({ message: "Password updated successfully." });
+  } catch (error) {
+    next(error);
   }
-
-  const user = await User.findById(req.user._id);
-  if (!user) return res.status(404).json({ message: "User not found" });
-
-  user.passwordHash = await bcrypt.hash(newPassword, 10);
-  await user.save();
-
-  res.json({ message: "Password updated successfully." });
 };
 
 module.exports = {

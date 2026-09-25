@@ -342,6 +342,116 @@ const templates = {
       </p>
     </div>
   `,
+
+  returnApproved: (order, recipientName) => `
+    <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="margin-bottom: 24px;">
+      <tr>
+        <td>
+          <span style="font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 1.5px; color: #047857; display: block; margin-bottom: 4px;">
+            Return Approved
+          </span>
+          <h1 style="margin: 0 0 10px; font-family: Georgia, serif; font-size: 22px; color: #1A1A1A; font-weight: normal;">
+            Return Request Approved for #${order.orderNumber}
+          </h1>
+          <p style="margin: 0; font-size: 13px; color: #525252; line-height: 1.6;">
+            Hello ${recipientName.split(" ")[0]}, your return request has been reviewed and approved. Our courier partner will pick up the package from your delivery address.
+          </p>
+        </td>
+      </tr>
+    </table>
+
+    <div style="background-color: #FAF8F5; border-radius: 8px; border: 1px solid rgba(212, 175, 55, 0.2); padding: 16px; margin-bottom: 24px;">
+      <p style="margin: 0 0 8px; font-size: 12px; font-weight: 600; color: #1A1A1A; text-transform: uppercase; letter-spacing: 1px;">
+        Pickup Information
+      </p>
+      <p style="margin: 0 0 4px; font-size: 13px; color: #525252;">
+        <strong>Return Order ID:</strong> ${order.returnRequest?.shiprocketReturnOrderId || `${order.orderNumber}-RET`}
+      </p>
+      ${
+        order.returnRequest?.reverseAwb
+          ? `<p style="margin: 0; font-size: 13px; color: #525252;"><strong>Reverse AWB:</strong> ${order.returnRequest.reverseAwb}</p>`
+          : ""
+      }
+    </div>
+
+    <div style="background-color: #FFFBEB; border-left: 3px solid #D97706; padding: 12px 14px; border-radius: 4px; margin-bottom: 24px;">
+      <p style="margin: 0; font-size: 12px; color: #92400E; line-height: 1.5;">
+        <strong>Instructions:</strong> Keep the items in their original packaging along with all tags and seal intact. Once picked up and verified at our fulfillment facility, your refund will be disbursed.
+      </p>
+    </div>
+  `,
+
+  returnRejected: (order, recipientName, reason) => `
+    <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="margin-bottom: 24px;">
+      <tr>
+        <td>
+          <span style="font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 1.5px; color: #B91C1C; display: block; margin-bottom: 4px;">
+            Return Update
+          </span>
+          <h1 style="margin: 0 0 10px; font-family: Georgia, serif; font-size: 22px; color: #1A1A1A; font-weight: normal;">
+            Return Request Update — #${order.orderNumber}
+          </h1>
+          <p style="margin: 0; font-size: 13px; color: #525252; line-height: 1.6;">
+            Hello ${recipientName.split(" ")[0]}, we have completed the review of your return request for order <strong>#${order.orderNumber}</strong>. Unfortunately, we are unable to accept the return at this time.
+          </p>
+        </td>
+      </tr>
+    </table>
+
+    <div style="background-color: #FEF2F2; border-left: 3px solid #DC2626; padding: 14px 16px; border-radius: 4px; margin-bottom: 24px;">
+      <p style="margin: 0 0 6px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 1px; color: #991B1B;">
+        Reason for Decline
+      </p>
+      <p style="margin: 0; font-size: 13px; color: #7F1D1D; line-height: 1.5;">
+        ${reason || "Does not comply with our return hygiene and quality inspection policies."}
+      </p>
+    </div>
+  `,
+
+  refundProcessed: (order, recipientName, refund) => `
+    <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="margin-bottom: 24px;">
+      <tr>
+        <td>
+          <span style="font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 1.5px; color: #047857; display: block; margin-bottom: 4px;">
+            Refund Processed
+          </span>
+          <h1 style="margin: 0 0 10px; font-family: Georgia, serif; font-size: 22px; color: #1A1A1A; font-weight: normal;">
+            Refund Issued: ₹${Number(refund.amount || 0).toLocaleString("en-IN")}
+          </h1>
+          <p style="margin: 0; font-size: 13px; color: #525252; line-height: 1.6;">
+            Hello ${recipientName.split(" ")[0]}, your refund for order <strong>#${order.orderNumber}</strong> has been successfully processed via netbanking/bank transfer.
+          </p>
+        </td>
+      </tr>
+    </table>
+
+    <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="background-color: #FAF8F5; border-radius: 8px; border: 1px solid rgba(212, 175, 55, 0.2); padding: 16px; margin-bottom: 24px;">
+      <tr>
+        <td style="font-size: 12px; color: #737373; padding: 4px 0;">Refund Amount</td>
+        <td align="right" style="font-size: 13px; color: #047857; font-weight: 600; padding: 4px 0;">₹${Number(refund.amount || 0).toLocaleString("en-IN")}</td>
+      </tr>
+      <tr>
+        <td style="font-size: 12px; color: #737373; padding: 4px 0;">Settlement Type</td>
+        <td align="right" style="font-size: 12px; color: #1A1A1A; font-weight: 500; padding: 4px 0; text-transform: capitalize;">${refund.type || "full"} Refund</td>
+      </tr>
+      <tr>
+        <td style="font-size: 12px; color: #737373; padding: 4px 0;">Transaction Reference / UTR</td>
+        <td align="right" style="font-size: 12px; font-family: monospace; color: #1A1A1A; font-weight: 600; padding: 4px 0;">${refund.referenceId}</td>
+      </tr>
+      <tr>
+        <td style="font-size: 12px; color: #737373; padding: 4px 0;">Settlement Account</td>
+        <td align="right" style="font-size: 12px; color: #1A1A1A; font-weight: 500; padding: 4px 0;">
+          ${order.returnRequest?.bankAccount?.accountNumber ? `•••• ${order.returnRequest.bankAccount.accountNumber.slice(-4)}` : "Registered Account"}
+        </td>
+      </tr>
+    </table>
+
+    <div style="background-color: #FAF8F5; border-left: 3px solid #B85D43; padding: 12px 14px; border-radius: 4px; margin-bottom: 20px;">
+      <p style="margin: 0; font-size: 12px; color: #525252; line-height: 1.5;">
+        <strong>Note:</strong> While the amount has been transferred from our end, it may take 2–5 business days to reflect in your bank account depending on your banking institution.
+      </p>
+    </div>
+  `,
 };
 
 // ==========================================
@@ -415,9 +525,76 @@ const sendPromotionalEmail = async ({ to, subject, htmlContent }) => {
   });
 };
 
+const sendReturnApprovedEmail = async (order) => {
+  const to = order.user?.email || order.guestInfo?.email;
+  if (!to) return;
+
+  const recipientName =
+    order.user?.name ||
+    order.guestInfo?.name ||
+    order.shippingAddress?.name ||
+    "Customer";
+
+  const bodyContent = templates.returnApproved(order, recipientName);
+
+  return await sendEmail({
+    to,
+    subject: `Return Approved — #${order.orderNumber}`,
+    preheader: `Your return for order #${order.orderNumber} is approved. Pickup details inside.`,
+    bodyContent,
+  });
+};
+
+const sendReturnRejectedEmail = async (order, reason) => {
+  const to = order.user?.email || order.guestInfo?.email;
+  if (!to) return;
+
+  const recipientName =
+    order.user?.name ||
+    order.guestInfo?.name ||
+    order.shippingAddress?.name ||
+    "Customer";
+
+  const bodyContent = templates.returnRejected(order, recipientName, reason);
+
+  return await sendEmail({
+    to,
+    subject: `Return Request Update — #${order.orderNumber}`,
+    preheader: `Update regarding your return request for order #${order.orderNumber}.`,
+    bodyContent,
+  });
+};
+
+const sendRefundProcessedEmail = async (order, refundData) => {
+  const to = order.user?.email || order.guestInfo?.email;
+  if (!to) return;
+
+  const recipientName =
+    order.user?.name ||
+    order.guestInfo?.name ||
+    order.shippingAddress?.name ||
+    "Customer";
+
+  const bodyContent = templates.refundProcessed(
+    order,
+    recipientName,
+    refundData,
+  );
+
+  return await sendEmail({
+    to,
+    subject: `Refund Processed — ₹${Number(refundData.amount).toLocaleString("en-IN")} for #${order.orderNumber}`,
+    preheader: `Your refund of ₹${Number(refundData.amount).toLocaleString("en-IN")} has been released.`,
+    bodyContent,
+  });
+};
+
 module.exports = {
   sendOrderConfirmation,
   sendPasswordReset,
   sendPromotionalEmail,
   sendRegistrationOtpEmail,
+  sendReturnApprovedEmail,
+  sendReturnRejectedEmail,
+  sendRefundProcessedEmail,
 };

@@ -5,105 +5,118 @@ const razorpay = require("../config/razorpay");
 const Order = require("../models/Order");
 const { sendOrderConfirmation } = require("../services/email.service");
 const { finalizeReservation } = require("../services/stockReservation.service");
+const { validate } = require("../middleware/validate.middleware");
+const {
+  createRazorpayOrderSchema,
+  verifyRazorpayPaymentSchema,
+} = require("../validations/payment.validation");
 
 const router = express.Router();
 
 // POST /api/payments/razorpay/create-order
-// Body: { orderId } — the Order doc already created via POST /api/orders
-router.post("/razorpay/create-order", async (req, res) => {
-  try {
-    const { orderId } = req.body;
-    const order = await Order.findById(orderId);
-    if (!order) return res.status(404).json({ message: "Order not found" });
+router.post(
+  "/razorpay/create-order",
+  validate(createRazorpayOrderSchema, "body"),
+  async (req, res, next) => {
+    try {
+      const { orderId } = req.body;
+      const order = await Order.findById(orderId);
+      if (!order) return res.status(404).json({ message: "Order not found" });
 
-    const razorpayOrder = await razorpay.orders.create({
-      amount: Math.round(order.total * 100), // paise
-      currency: "INR",
-      receipt: order.orderNumber,
-    });
+      const razorpayOrder = await razorpay.orders.create({
+        amount: Math.round(order.total * 100), // paise
+        currency: "INR",
+        receipt: order.orderNumber,
+      });
 
-    order.payment.razorpayOrderId = razorpayOrder.id;
-    await order.save();
+      order.payment.razorpayOrderId = razorpayOrder.id;
+      await order.save();
 
-    res.json({
-      razorpayOrderId: razorpayOrder.id,
-      amount: razorpayOrder.amount,
-      key: process.env.RAZORPAY_KEY_ID,
-    });
-  } catch (err) {
-    console.error("Razorpay order creation error:", err);
-    res.status(500).json({ message: "Failed to initiate Razorpay order" });
-  }
-});
+      return res.json({
+        razorpayOrderId: razorpayOrder.id,
+        amount: razorpayOrder.amount,
+        key: process.env.RAZORPAY_KEY_ID,
+      });
+    } catch (err) {
+      console.error("Razorpay order creation error:", err);
+      return res
+        .status(500)
+        .json({ message: "Failed to initiate Razorpay order" });
+    }
+  },
+);
 
 // POST /api/payments/razorpay/verify
-// Body: { orderId, razorpay_order_id, razorpay_payment_id, razorpay_signature }
-router.post("/razorpay/verify", async (req, res) => {
-  const {
-    orderId,
-    razorpay_order_id,
-    razorpay_payment_id,
-    razorpay_signature,
-  } = req.body;
+router.post(
+  "/razorpay/verify",
+  validate(verifyRazorpayPaymentSchema, "body"),
+  async (req, res, next) => {
+    const {
+      orderId,
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature,
+    } = req.body;
 
-  const expected = crypto
-    .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET || "")
-    .update(`${razorpay_order_id}|${razorpay_payment_id}`)
-    .digest("hex");
+    const expected = crypto
+      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET || "")
+      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+      .digest("hex");
 
-  if (expected !== razorpay_signature) {
-    return res.status(400).json({ message: "Payment verification failed" });
-  }
-
-  const session = await mongoose.startSession();
-  session.startTransaction();
-
-  try {
-    const order = await Order.findById(orderId)
-      .populate("user", "name email")
-      .session(session);
-    if (!order) {
-      await session.abortTransaction();
-      session.endSession();
-      return res.status(404).json({ message: "Order not found" });
+    if (expected !== razorpay_signature) {
+      return res.status(400).json({ message: "Payment verification failed" });
     }
 
-    // Idempotency check: if webhook already finalized this order, don't duplicate decrement
-    if (order.payment.status === "paid") {
-      await session.abortTransaction();
-      session.endSession();
-      return res.json({ message: "Payment already verified", order });
-    }
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-    order.payment.status = "paid";
-    order.payment.razorpayPaymentId = razorpay_payment_id;
-    order.status = "confirmed";
-    order.statusHistory.push({ status: "confirmed" });
-    await order.save({ session });
-
-    // Atomically decrement stock and remove reservation inside transaction
-    await finalizeReservation(order.items, session);
-
-    await session.commitTransaction();
-    session.endSession();
-
-    // ✅ AWAIT the email before sending response so Vercel doesn't kill the lambda
     try {
-      await sendOrderConfirmation(order);
-    } catch (err) {
-      console.error("Order email failed:", err.message);
-    }
+      const order = await Order.findById(orderId)
+        .populate("user", "name email")
+        .session(session);
 
-    return res.json({ message: "Payment verified", order });
-  } catch (err) {
-    await session.abortTransaction();
-    session.endSession();
-    console.error("Verification transaction failed:", err);
-    return res
-      .status(500)
-      .json({ message: "Failed to finalize payment confirmation" });
-  }
-});
+      if (!order) {
+        await session.abortTransaction();
+        session.endSession();
+        return res.status(404).json({ message: "Order not found" });
+      }
+
+      // Idempotency check: if webhook already finalized this order, skip duplicate decrement
+      if (order.payment.status === "paid") {
+        await session.abortTransaction();
+        session.endSession();
+        return res.json({ message: "Payment already verified", order });
+      }
+
+      order.payment.status = "paid";
+      order.payment.razorpayPaymentId = razorpay_payment_id;
+      order.status = "confirmed";
+      order.statusHistory.push({ status: "confirmed" });
+      await order.save({ session });
+
+      // Atomically decrement stock and remove reservation inside transaction
+      await finalizeReservation(order.items, session);
+
+      await session.commitTransaction();
+      session.endSession();
+
+      try {
+        await sendOrderConfirmation(order);
+      } catch (err) {
+        console.error("Order email failed:", err.message);
+      }
+
+      return res.json({ message: "Payment verified", order });
+    } catch (err) {
+      await session.abortTransaction();
+      session.endSession();
+      console.error("Verification transaction failed:", err);
+      return res
+        .status(500)
+        .json({ message: "Failed to finalize payment confirmation" });
+    }
+  },
+);
 
 // POST /api/payments/razorpay/webhook — source of truth
 router.post(
@@ -144,7 +157,6 @@ router.post(
           await session.commitTransaction();
           session.endSession();
 
-          // ✅ AWAIT email execution before returning to Razorpay webhook handler
           try {
             await sendOrderConfirmation(order);
           } catch (err) {
@@ -165,4 +177,5 @@ router.post(
     return res.json({ received: true });
   },
 );
+
 module.exports = router;

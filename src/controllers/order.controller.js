@@ -6,6 +6,11 @@ const Setting = require("../models/Setting");
 const razorpay = require("../config/razorpay");
 const { invalidateCache } = require("../middleware/cache.middleware");
 const {
+  sendReturnApprovedEmail,
+  sendReturnRejectedEmail,
+  sendRefundProcessedEmail,
+} = require("../services/email.service");
+const {
   createReversePickup,
   cancelShipment,
 } = require("../services/shiprocket.service");
@@ -36,8 +41,8 @@ const getActiveShippingConfig = async () => {
 // GET /api/orders/estimate-shipping
 const estimateShipping = async (req, res) => {
   try {
-    const subtotal = Number(req.query.subtotal) || 0;
-    const isCod = req.query.paymentMethod === "cod";
+    const { subtotal, paymentMethod } = req.query;
+    const isCod = paymentMethod === "cod";
 
     const { standardFee, threshold, codFee } = await getActiveShippingConfig();
 
@@ -46,7 +51,7 @@ const estimateShipping = async (req, res) => {
     const codSurcharge = isCod ? codFee : 0;
     const totalShippingFee = baseShipping + codSurcharge;
 
-    res.json({
+    return res.json({
       shippingFee: totalShippingFee,
       baseShipping,
       codFee: codSurcharge,
@@ -55,20 +60,16 @@ const estimateShipping = async (req, res) => {
       standardFee,
     });
   } catch (err) {
-    res.status(500).json({ message: "Failed to estimate shipping" });
+    return res.status(500).json({ message: "Failed to estimate shipping" });
   }
 };
 
 // POST /api/orders
-const createOrder = async (req, res) => {
+const createOrder = async (req, res, next) => {
   await releaseExpiredReservations();
 
   const { items, shippingAddress, guestInfo, paymentMethod } = req.body;
 
-  if (!items?.length) return res.status(400).json({ message: "Cart is empty" });
-  if (!shippingAddress) {
-    return res.status(400).json({ message: "Shipping address is required" });
-  }
   if (!req.user && !guestInfo?.email) {
     return res.status(400).json({
       message: "Guest checkout requires guestInfo (name, email, phone)",
@@ -95,7 +96,7 @@ const createOrder = async (req, res) => {
       });
     }
 
-    let unitPrice = product.basePrice;
+    let unitPrice = Number(product.basePrice) || 0;
     let variantLabel = null;
 
     if (item.variantSku && product.variants?.length) {
@@ -110,7 +111,7 @@ const createOrder = async (req, res) => {
           message: `Insufficient stock for ${product.name} (${variant.label})`,
         });
       }
-      unitPrice = variant.price;
+      unitPrice = Number(variant.price) || 0;
       variantLabel = variant.label;
     } else if (!product.variants?.length) {
       if (product.stock - (product.reservedStock || 0) < item.qty) {
@@ -121,19 +122,23 @@ const createOrder = async (req, res) => {
     }
 
     let finalUnitPrice = unitPrice;
-    if (product.discount?.isActive) {
+    const discountPercent =
+      product.discount?.percent ?? product.discount?.percentage ?? 0;
+
+    if (product.discount?.isActive && discountPercent > 0) {
       finalUnitPrice = Math.round(
-        unitPrice * (1 - product.discount.percent / 100),
+        unitPrice * (1 - Number(discountPercent) / 100),
       );
       discountAmount += (unitPrice - finalUnitPrice) * item.qty;
     }
 
     subtotal += unitPrice * item.qty;
+
     resolvedItems.push({
       product: product._id,
       variantSku: item.variantSku,
       name: variantLabel ? `${product.name} — ${variantLabel}` : product.name,
-      image: product.images?.[0],
+      image: product.images?.[0] || "",
       price: finalUnitPrice,
       qty: item.qty,
     });
@@ -141,7 +146,7 @@ const createOrder = async (req, res) => {
 
   // Step 2: Shipping calculations
   const { standardFee, threshold, codFee } = await getActiveShippingConfig();
-  const netSubtotal = subtotal - discountAmount;
+  const netSubtotal = Math.max(0, subtotal - discountAmount);
   const isFreeShipping = netSubtotal >= threshold;
   const baseShipping = isFreeShipping ? 0 : standardFee;
   const appliedCodFee = isCod ? codFee : 0;
@@ -179,7 +184,6 @@ const createOrder = async (req, res) => {
     });
 
     if (isCod) {
-      // Atomic stock reduction directly in session
       for (const item of items) {
         let updated;
         if (item.variantSku) {
@@ -210,14 +214,12 @@ const createOrder = async (req, res) => {
         }
       }
     } else {
-      // Online payment holds reservation
       await reserveStock(items);
     }
 
     await session.commitTransaction();
     session.endSession();
 
-    // Cache purge and email dispatch for COD
     if (isCod) {
       invalidateCache("products");
       const { sendOrderConfirmation } = require("../services/email.service");
@@ -242,22 +244,22 @@ const createOrder = async (req, res) => {
 };
 
 // GET /api/orders/my
-const myOrders = async (req, res) => {
-  const orders = await Order.find({ user: req.user._id }).sort({
-    createdAt: -1,
-  });
-  res.json(orders);
+const myOrders = async (req, res, next) => {
+  try {
+    const orders = await Order.find({ user: req.user._id }).sort({
+      createdAt: -1,
+    });
+    return res.json(orders);
+  } catch (error) {
+    next(error);
+  }
 };
 
 // GET /api/orders (admin)
 const allOrders = async (req, res) => {
   try {
-    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-    const limit = Math.max(1, parseInt(req.query.limit, 10) || 10);
+    const { page, limit, status, search } = req.query;
     const skip = (page - 1) * limit;
-
-    const status = req.query.status ? req.query.status.trim() : "all";
-    const search = req.query.search ? req.query.search.trim() : "";
 
     const filter = {};
     if (status && status !== "all") {
@@ -357,7 +359,7 @@ const allOrders = async (req, res) => {
       delivered: 0,
     };
 
-    res.json({
+    return res.json({
       orders,
       pagination: {
         total,
@@ -371,54 +373,132 @@ const allOrders = async (req, res) => {
     });
   } catch (err) {
     console.error("Fetch orders error:", err);
-    res.status(500).json({ message: "Failed to load orders" });
+    return res.status(500).json({ message: "Failed to load orders" });
   }
 };
 
 // GET /api/orders/:id
-const getOrder = async (req, res) => {
-  const { id } = req.params;
-  const query = mongoose.isValidObjectId(id)
-    ? { _id: id }
-    : { orderNumber: id };
+const getOrder = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const query = mongoose.isValidObjectId(id)
+      ? { _id: id }
+      : { orderNumber: id };
 
-  const order = await Order.findOne(query).populate("user", "name email");
-  if (!order) return res.status(404).json({ message: "Order not found" });
+    const order = await Order.findOne(query).populate("user", "name email");
+    if (!order) return res.status(404).json({ message: "Order not found" });
 
-  const isOwner = order.user && String(order.user._id) === String(req.user._id);
-  if (req.user.role !== "admin" && !isOwner) {
-    return res
-      .status(403)
-      .json({ message: "Not authorized to view this order" });
+    const isOwner =
+      order.user && String(order.user._id) === String(req.user._id);
+    if (req.user.role !== "admin" && !isOwner) {
+      return res
+        .status(403)
+        .json({ message: "Not authorized to view this order" });
+    }
+
+    return res.json(order);
+  } catch (error) {
+    next(error);
   }
-
-  res.json(order);
 };
 
 // PATCH /api/orders/:id/status
-const updateStatus = async (req, res) => {
-  const order = await Order.findById(req.params.id);
-  if (!order) return res.status(404).json({ message: "Order not found" });
+const updateStatus = async (req, res, next) => {
+  try {
+    const { status } = req.body;
 
-  order.status = req.body.status;
-  order.statusHistory.push({ status: req.body.status });
-  await order.save();
-  res.json(order);
+    const ALLOWED_STATUSES = [
+      "placed",
+      "confirmed",
+      "processing",
+      "shipped",
+      "delivered",
+      "cancelled",
+      "returned",
+      "return_requested",
+      "return_approved",
+      "return_rejected",
+    ];
+
+    if (!status || !ALLOWED_STATUSES.includes(status)) {
+      return res.status(400).json({
+        message: `Invalid status "${status}". Allowed values: ${ALLOWED_STATUSES.join(", ")}`,
+      });
+    }
+
+    // Populate user to ensure email/name exist if notification triggers
+    const order = await Order.findById(req.params.id).populate(
+      "user",
+      "name email",
+    );
+    if (!order) return res.status(404).json({ message: "Order not found" });
+
+    // Prevent redundant updates
+    if (order.status === status) {
+      return res.json(order);
+    }
+
+    // Disallow moving out of terminal states without formal refund/restock flows
+    if (["cancelled", "returned"].includes(order.status)) {
+      return res.status(400).json({
+        message: `Cannot update an order that is already in terminal state "${order.status}".`,
+      });
+    }
+
+    order.status = status;
+    order.statusHistory.push({
+      status,
+      timestamp: new Date(),
+    });
+
+    // Auto-mark COD as paid once delivered
+    if (status === "delivered" && order.payment?.method === "cod") {
+      order.payment.status = "paid";
+    }
+
+    order.markModified("statusHistory");
+    order.markModified("payment");
+    await order.save();
+
+    // Optional: Trigger shipping/delivered status email notifications
+    // (non-blocking so it won't stall admin response)
+    if (status === "shipped" || status === "delivered") {
+      const recipientEmail =
+        order.user?.email ||
+        order.guestInfo?.email ||
+        order.shippingAddress?.email;
+
+      if (recipientEmail) {
+        // You can dispatch standard status emails here if defined in email.service
+        console.log(
+          `[Order Status Update]: Notifying ${recipientEmail} of status "${status}"`,
+        );
+      }
+    }
+
+    return res.json(order);
+  } catch (error) {
+    next(error);
+  }
 };
 
 // PATCH /api/orders/:id/collect-cod
-const collectCodPayment = async (req, res) => {
-  const order = await Order.findById(req.params.id);
-  if (!order) return res.status(404).json({ message: "Order not found" });
-  if (order.payment.method !== "cod") {
-    return res
-      .status(400)
-      .json({ message: "This order was not placed as Cash on Delivery" });
-  }
+const collectCodPayment = async (req, res, next) => {
+  try {
+    const order = await Order.findById(req.params.id);
+    if (!order) return res.status(404).json({ message: "Order not found" });
+    if (order.payment.method !== "cod") {
+      return res
+        .status(400)
+        .json({ message: "This order was not placed as Cash on Delivery" });
+    }
 
-  order.payment.status = "paid";
-  await order.save();
-  res.json(order);
+    order.payment.status = "paid";
+    await order.save();
+    return res.json(order);
+  } catch (error) {
+    next(error);
+  }
 };
 
 // POST /api/orders/:id/cancel
@@ -447,7 +527,7 @@ const cancelOrder = async (req, res) => {
   session.startTransaction();
 
   try {
-    // 1. Atomically restock products within session
+    // 1. Restock products
     for (const item of order.items) {
       if (item.variantSku) {
         await Product.updateOne(
@@ -506,7 +586,7 @@ const cancelOrder = async (req, res) => {
       );
     }
 
-    // 4. Update order record within session
+    // 4. Update order record
     order.status = "cancelled";
     order.statusHistory.push({ status: "cancelled" });
     if (refundData) {
@@ -518,210 +598,240 @@ const cancelOrder = async (req, res) => {
     await session.commitTransaction();
     session.endSession();
 
-    // Invalidate product catalog cache after stock return
     invalidateCache("products");
 
-    res.json({ message: "Order cancelled successfully", order });
+    return res.json({ message: "Order cancelled successfully", order });
   } catch (err) {
     await session.abortTransaction();
     session.endSession();
     console.error("Cancellation Transaction Failed:", err);
-    res.status(500).json({ message: "Failed to cancel order safely." });
+    return res.status(500).json({ message: "Failed to cancel order safely." });
   }
 };
 
-// POST /api/orders/:id/return-request (Customer)
-const requestReturn = async (req, res) => {
-  const { reason, notes, photos, bankAccount, saveAccount } = req.body;
+// POST /api/orders/:id/return-request
+const requestReturn = async (req, res, next) => {
+  try {
+    const { reason, notes, photos, bankAccount, saveAccount } = req.body;
 
-  const order = await Order.findById(req.params.id);
-  if (!order) return res.status(404).json({ message: "Order not found" });
+    const order = await Order.findById(req.params.id);
+    if (!order) return res.status(404).json({ message: "Order not found" });
 
-  if (String(order.user) !== String(req.user._id)) {
-    return res.status(403).json({ message: "Unauthorized" });
-  }
-
-  if (order.status !== "delivered") {
-    return res.status(400).json({
-      message: "Returns can only be requested for delivered orders.",
-    });
-  }
-
-  const windowMs = RETURN_WINDOW_DAYS * 24 * 60 * 60 * 1000;
-  const orderPlacementTime = new Date(order.createdAt).getTime();
-  const timeElapsed = Date.now() - orderPlacementTime;
-
-  if (timeElapsed > windowMs) {
-    return res.status(400).json({
-      message: `The ${RETURN_WINDOW_DAYS}-day return policy window from the order placement date has expired. Returns are no longer accepted.`,
-    });
-  }
-
-  if (
-    order.returnRequest?.status &&
-    order.returnRequest.status !== "rejected"
-  ) {
-    return res.status(400).json({
-      message: "A return request is already in progress for this order.",
-    });
-  }
-
-  if (!reason) {
-    return res.status(400).json({ message: "Return reason is required." });
-  }
-
-  if (
-    !bankAccount?.accountHolderName ||
-    !bankAccount?.accountNumber ||
-    !bankAccount?.ifscCode
-  ) {
-    return res.status(400).json({
-      message: "Bank account details are required for refund processing.",
-    });
-  }
-
-  if (saveAccount) {
-    const user = await User.findById(req.user._id);
-    if (user) {
-      user.bankAccount = {
-        accountHolderName: bankAccount.accountHolderName,
-        accountNumber: bankAccount.accountNumber,
-        ifscCode: bankAccount.ifscCode.toUpperCase().trim(),
-        bankName: bankAccount.bankName || "",
-      };
-      await user.save();
+    if (String(order.user) !== String(req.user._id)) {
+      return res.status(403).json({ message: "Unauthorized" });
     }
-  }
 
-  order.status = "return_requested";
-  order.returnRequest = {
-    reason,
-    notes: notes || "",
-    photos: photos || [],
-    bankAccount: {
-      accountHolderName: bankAccount.accountHolderName,
-      accountNumber: bankAccount.accountNumber,
-      ifscCode: bankAccount.ifscCode.toUpperCase().trim(),
-      bankName: bankAccount.bankName || "",
-    },
-    status: "pending",
-    requestedAt: new Date(),
-  };
-
-  order.statusHistory.push({ status: "return_requested" });
-  await order.save();
-
-  res.status(200).json(order);
-};
-
-// PATCH /api/orders/:id/return-review (Admin)
-const reviewReturn = async (req, res) => {
-  const { action, rejectReason } = req.body;
-  const order = await Order.findById(req.params.id);
-  if (!order) return res.status(404).json({ message: "Order not found" });
-
-  if (order.status !== "return_requested") {
-    return res.status(400).json({
-      message: "Order does not have a pending return request.",
-    });
-  }
-
-  if (action === "reject") {
-    order.status = "return_rejected";
-    order.returnRequest.status = "rejected";
-    order.returnRequest.notes = rejectReason
-      ? `${order.returnRequest.notes || ""}\n[Rejection Note]: ${rejectReason}`
-      : order.returnRequest.notes;
-    order.returnRequest.processedAt = new Date();
-    order.statusHistory.push({ status: "return_rejected" });
-    await order.save();
-    return res.json(order);
-  }
-
-  if (action === "approve") {
-    try {
-      const srRes = await createReversePickup(order);
-
-      order.status = "return_approved";
-      order.returnRequest.status = "approved";
-      order.returnRequest.shiprocketReturnOrderId =
-        srRes?.order_id || `${order.orderNumber}-RET`;
-      order.returnRequest.shiprocketReturnShipmentId = srRes?.shipment_id
-        ? String(srRes.shipment_id)
-        : "";
-      order.returnRequest.reverseAwb = srRes?.awb_code || "";
-      order.returnRequest.processedAt = new Date();
-
-      order.statusHistory.push({ status: "return_approved" });
-      await order.save();
-      return res.json(order);
-    } catch (srErr) {
-      console.error(
-        "Shiprocket reverse pickup failed:",
-        srErr.response?.data || srErr.message,
-      );
-      return res.status(500).json({
-        message:
-          srErr.response?.data?.message ||
-          "Failed to initiate reverse pickup on Shiprocket. Please check balance and credentials.",
+    if (order.status !== "delivered") {
+      return res.status(400).json({
+        message: "Returns can only be requested for delivered orders.",
       });
     }
-  }
 
-  return res
-    .status(400)
-    .json({ message: "Invalid action. Use 'approve' or 'reject'." });
+    const windowMs = RETURN_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+    const orderPlacementTime = new Date(order.createdAt).getTime();
+    const timeElapsed = Date.now() - orderPlacementTime;
+
+    if (timeElapsed > windowMs) {
+      return res.status(400).json({
+        message: `The ${RETURN_WINDOW_DAYS}-day return policy window from the order placement date has expired. Returns are no longer accepted.`,
+      });
+    }
+
+    if (
+      order.returnRequest?.status &&
+      order.returnRequest.status !== "rejected"
+    ) {
+      return res.status(400).json({
+        message: "A return request is already in progress for this order.",
+      });
+    }
+
+    if (saveAccount) {
+      const user = await User.findById(req.user._id);
+      if (user) {
+        user.bankAccount = {
+          accountHolderName: bankAccount.accountHolderName,
+          accountNumber: bankAccount.accountNumber,
+          ifscCode: bankAccount.ifscCode,
+          bankName: bankAccount.bankName,
+        };
+        await user.save();
+      }
+    }
+
+    order.status = "return_requested";
+    order.returnRequest = {
+      reason,
+      notes,
+      photos,
+      bankAccount,
+      status: "pending",
+      requestedAt: new Date(),
+    };
+
+    order.statusHistory.push({ status: "return_requested" });
+    await order.save();
+
+    return res.status(200).json(order);
+  } catch (error) {
+    next(error);
+  }
 };
 
-// POST /api/orders/:id/process-refund (Admin)
-const processManualRefund = async (req, res) => {
-  const { refundAmount, referenceId, adminNotes } = req.body;
+const reviewReturn = async (req, res, next) => {
+  try {
+    const { action, rejectReason } = req.body;
 
-  const order = await Order.findById(req.params.id);
-  if (!order) return res.status(404).json({ message: "Order not found" });
+    const order = await Order.findById(req.params.id).populate(
+      "user",
+      "name email",
+    );
+    if (!order) return res.status(404).json({ message: "Order not found" });
 
-  if (
-    !["return_approved", "return_requested", "delivered"].includes(order.status)
-  ) {
-    return res.status(400).json({
-      message: "Cannot release refund for an order in this status.",
-    });
+    if (order.status !== "return_requested") {
+      return res.status(400).json({
+        message: "Order does not have a pending return request.",
+      });
+    }
+
+    if (!order.returnRequest) {
+      order.returnRequest = {};
+    }
+
+    if (action === "reject") {
+      order.status = "return_rejected";
+      order.returnRequest.status = "rejected";
+      order.returnRequest.notes = rejectReason
+        ? `${order.returnRequest.notes || ""}\n[Rejection Note]: ${rejectReason}`.trim()
+        : order.returnRequest.notes;
+      order.returnRequest.processedAt = new Date();
+      order.statusHistory.push({ status: "return_rejected" });
+
+      // Explicitly tell Mongoose that the nested subdocument has changed
+      order.markModified("returnRequest");
+      await order.save();
+
+      // Trigger email and await or catch properly
+      try {
+        await sendReturnRejectedEmail(order, rejectReason);
+      } catch (mailErr) {
+        console.error("[Mail Error - Return Rejected]:", mailErr.message);
+      }
+
+      return res.json(order);
+    }
+
+    if (action === "approve") {
+      try {
+        const srRes = await createReversePickup(order);
+
+        order.status = "return_approved";
+        order.returnRequest.status = "approved";
+        order.returnRequest.shiprocketReturnOrderId = srRes?.order_id
+          ? String(srRes.order_id)
+          : `${order.orderNumber}-RET`;
+        order.returnRequest.shiprocketReturnShipmentId = srRes?.shipment_id
+          ? String(srRes.shipment_id)
+          : "";
+        order.returnRequest.reverseAwb = srRes?.awb_code || "";
+        order.returnRequest.processedAt = new Date();
+        order.statusHistory.push({ status: "return_approved" });
+
+        // Explicitly tell Mongoose that the nested subdocument has changed
+        order.markModified("returnRequest");
+        await order.save();
+
+        // Trigger email and await or catch properly
+        try {
+          await sendReturnApprovedEmail(order);
+        } catch (mailErr) {
+          console.error("[Mail Error - Return Approved]:", mailErr.message);
+        }
+
+        return res.json(order);
+      } catch (srErr) {
+        console.error(
+          "Shiprocket reverse pickup failed:",
+          srErr.response?.data || srErr.message,
+        );
+        return res.status(500).json({
+          message:
+            srErr.response?.data?.message ||
+            "Failed to initiate reverse pickup on Shiprocket. Please check balance and credentials.",
+        });
+      }
+    }
+
+    return res
+      .status(400)
+      .json({ message: "Invalid action. Must be 'approve' or 'reject'." });
+  } catch (error) {
+    next(error);
   }
+};
 
-  const amount = Number(refundAmount);
-  if (isNaN(amount) || amount <= 0 || amount > order.total) {
-    return res.status(400).json({
-      message: `Invalid refund amount. Must be between ₹1 and total invoice ₹${order.total}.`,
-    });
+const processManualRefund = async (req, res, next) => {
+  try {
+    const { refundAmount, referenceId, adminNotes } = req.body;
+
+    const order = await Order.findById(req.params.id).populate(
+      "user",
+      "name email",
+    );
+    if (!order) return res.status(404).json({ message: "Order not found" });
+
+    if (
+      !["return_approved", "return_requested", "delivered"].includes(
+        order.status,
+      )
+    ) {
+      return res.status(400).json({
+        message: "Cannot release refund for an order in this status.",
+      });
+    }
+
+    if (refundAmount > order.total) {
+      return res.status(400).json({
+        message: `Invalid refund amount. Cannot exceed total invoice ₹${order.total}.`,
+      });
+    }
+
+    const refundType =
+      Number(refundAmount) === Number(order.total) ? "full" : "partial";
+
+    if (!order.returnRequest) {
+      order.returnRequest = {};
+    }
+
+    const refundPayload = {
+      amount: Number(refundAmount),
+      type: refundType,
+      referenceId,
+      paymentMode: "netbanking",
+      refundedAt: new Date(),
+      adminNotes: adminNotes || "",
+    };
+
+    order.returnRequest.refund = refundPayload;
+    order.returnRequest.status = "completed";
+    order.status = "returned";
+    order.statusHistory.push({ status: "returned" });
+
+    // Explicitly tell Mongoose that the nested subdocument has changed
+    order.markModified("returnRequest");
+    await order.save();
+
+    // Trigger refund confirmation email
+    try {
+      await sendRefundProcessedEmail(order, refundPayload);
+    } catch (mailErr) {
+      console.error("[Mail Error - Refund Processed]:", mailErr.message);
+    }
+
+    return res.json(order);
+  } catch (error) {
+    next(error);
   }
-
-  if (!referenceId?.trim()) {
-    return res.status(400).json({
-      message: "Bank UTR or Netbanking transaction reference ID is required.",
-    });
-  }
-
-  const refundType = amount === order.total ? "full" : "partial";
-
-  if (!order.returnRequest) {
-    order.returnRequest = {};
-  }
-
-  order.returnRequest.refund = {
-    amount,
-    type: refundType,
-    referenceId: referenceId.trim(),
-    paymentMode: "netbanking",
-    refundedAt: new Date(),
-    adminNotes: adminNotes || "",
-  };
-
-  order.returnRequest.status = "completed";
-  order.status = "returned";
-  order.statusHistory.push({ status: "returned" });
-
-  await order.save();
-  res.json(order);
 };
 
 module.exports = {
